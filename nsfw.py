@@ -81,6 +81,9 @@ HTML = """
 
 app = Flask(__name__)
 
+generator = torch.Generator(device="cuda").manual_seed(42)
+
+
 @dataclass
 class PromptSettings:
     """Sanitized prompt settings for image generation."""
@@ -174,8 +177,6 @@ def load_model(model_name: str) -> DiffusionPipeline:
     current_model_state["name"] = model_name
     return loaded_models[model_name]
 
-generator = torch.Generator(device="cuda").manual_seed(42)
-
 
 def render_template(settings: PromptSettings, image: str | None = None, error: str | None = None):
     """Render the HTML UI with the provided prompt details.
@@ -222,6 +223,35 @@ def generate_image(settings: PromptSettings) -> str:
     return base64.b64encode(buffer.getvalue()).decode()
 
 
+def discover_models(models_path: str) -> list[str]:
+    """Discover available models by scanning directory names in models_path.
+
+    :param models_path: Path to directory containing model subdirectories.
+    :type models_path: str
+    :returns: List of model directory names.
+    :rtype: list[str]
+    """
+    path = Path(models_path)
+    if not path.exists() or not path.is_dir():
+        raise ValueError(f"Models path does not exist or is not a directory: {models_path}")
+
+    models = [d.name for d in path.iterdir() if d.is_dir() and not d.name.startswith('.')]
+    if not models:
+        raise ValueError(f"No model directories found in: {models_path}")
+
+    return sorted(models)
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments for server configuration."""
+    parser = argparse.ArgumentParser(description="Run the NSFW Diffusers server.")
+    parser.add_argument("--host", default="0.0.0.0", help="Host/IP to bind the Flask server to.")
+    parser.add_argument("--port", type=int, default=5000, help="Port to listen on.")
+    parser.add_argument("--models-path", default="models",
+                        help="Path to directory containing model subdirectories.")
+    return parser.parse_args()
+
+
 @app.route('/', methods=['GET', 'POST'])
 def index():
     """Render the main HTML UI and handle image generation requests."""
@@ -257,35 +287,6 @@ def v1():
     image.save(buffer, format="PNG")
     buffer.seek(0)
     return send_file(buffer, mimetype='image/png')
-
-
-def discover_models(models_path: str) -> list[str]:
-    """Discover available models by scanning directory names in models_path.
-
-    :param models_path: Path to directory containing model subdirectories.
-    :type models_path: str
-    :returns: List of model directory names.
-    :rtype: list[str]
-    """
-    path = Path(models_path)
-    if not path.exists() or not path.is_dir():
-        raise ValueError(f"Models path does not exist or is not a directory: {models_path}")
-
-    models = [d.name for d in path.iterdir() if d.is_dir() and not d.name.startswith('.')]
-    if not models:
-        raise ValueError(f"No model directories found in: {models_path}")
-
-    return sorted(models)
-
-
-def parse_args() -> argparse.Namespace:
-    """Parse command-line arguments for server configuration."""
-    parser = argparse.ArgumentParser(description="Run the NSFW Diffusers server.")
-    parser.add_argument("--host", default="0.0.0.0", help="Host/IP to bind the Flask server to.")
-    parser.add_argument("--port", type=int, default=5000, help="Port to listen on.")
-    parser.add_argument("--models-path", default="models",
-                        help="Path to directory containing model subdirectories.")
-    return parser.parse_args()
 
 
 if __name__ == '__main__':
