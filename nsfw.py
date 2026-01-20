@@ -1,10 +1,13 @@
-"""Simple NSFW image generation server using Diffusers and Flask."""
+"""Simple image generation server using Diffusers and Flask."""
+from __future__ import annotations
+
 import argparse
 import base64
 import io
+import logging
 import os
-from dataclasses import dataclass
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -16,9 +19,10 @@ from flask import Flask, request, render_template_string, send_file
 DEFAULT_PROMPT = "Astronaut in a jungle, cold color palette, muted colors, detailed, 8k"
 DEFAULT_NEGATIVE = ""
 
+LOGGER = logging.getLogger(__name__)
+
 # Cache for loaded models
-loaded_models: dict[str, DiffusionPipeline] = {}
-current_model_state: dict[str, str | None] = {"name": None}
+LOADED_MODELS: dict[str, DiffusionPipeline] = {}
 
 # Model configuration (set during initialization)
 MODELS_PATH: str = ""
@@ -81,7 +85,7 @@ HTML = """
 
 app = Flask(__name__)
 
-generator = torch.Generator(device="cuda").manual_seed(42)
+GENERATOR = torch.Generator(device="cuda").manual_seed(42)
 
 
 @dataclass
@@ -166,19 +170,22 @@ def load_model(model_name: str) -> DiffusionPipeline:
     :returns: Cached pipeline instance.
     :rtype: DiffusionPipeline
     """
-    if model_name not in loaded_models:
+    if model_name not in LOADED_MODELS:
         model_path = os.path.join(MODELS_PATH, model_name)
-        print(f"Loading model from: {model_path}")
-        loaded_models[model_name] = DiffusionPipeline.from_pretrained(
+        LOGGER.info("Loading model from: %s", model_path)
+        LOADED_MODELS[model_name] = DiffusionPipeline.from_pretrained(
             model_path,
             dtype=torch.bfloat16,
-            device_map="cuda"
+            device_map="cuda",
         )
-    current_model_state["name"] = model_name
-    return loaded_models[model_name]
+    return LOADED_MODELS[model_name]
 
 
-def render_template(settings: PromptSettings, image: str | None = None, error: str | None = None):
+def render_template(
+    settings: PromptSettings,
+    image: str | None = None,
+    error: str | None = None,
+) -> str:
     """Render the HTML UI with the provided prompt details.
 
     :param settings: Current prompt settings for the user session.
@@ -209,22 +216,32 @@ def generate_image(settings: PromptSettings) -> str:
     :returns: Base64-encoded PNG of the generated image.
     :rtype: str
     """
-    pipe = load_model(settings.model)
-    image = pipe(
-        settings.prompt,
-        negative_prompt=settings.negative,
-        num_inference_steps=50,
-        true_cfg_scale=4.0,
-        generator=generator,
-    ).images[0]
-
+    image = generate_pil_image(settings)
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
     return base64.b64encode(buffer.getvalue()).decode()
 
 
+def generate_pil_image(settings: PromptSettings):
+    """Generate a PIL image from the supplied prompt settings.
+
+    :param settings: Sanitized prompt settings including model, prompt, and negative text.
+    :type settings: PromptSettings
+    :returns: Generated PIL image.
+    :rtype: PIL.Image.Image
+    """
+    pipe = load_model(settings.model)
+    return pipe(
+        settings.prompt,
+        negative_prompt=settings.negative,
+        num_inference_steps=50,
+        true_cfg_scale=4.0,
+        generator=GENERATOR,
+    ).images[0]
+
+
 def discover_models(models_path: str) -> list[str]:
-    """Discover available models by scanning directory names in models_path.
+    """Discover available models by scanning directory names in ``models_path``.
 
     :param models_path: Path to directory containing model subdirectories.
     :type models_path: str
@@ -264,6 +281,7 @@ def index():
         try:
             image_base64 = generate_image(settings)
         except (RuntimeError, ValueError) as exc:
+            LOGGER.exception("Image generation failed")
             error_message = f"Unable to generate image: {exc}"
     return render_template(settings, image=image_base64, error=error_message)
 
@@ -272,17 +290,13 @@ def index():
 def v1():
     """API endpoint for programmatic image generation."""
     settings = build_prompt_settings(request.get_json() if request.is_json else request.form)
-    print(f"/v1 generating with model: {settings.model}, "
-          f"prompt: {settings.prompt}, negative: {settings.negative}")
-    pipe = load_model(settings.model)
-    image = pipe(
+    LOGGER.info(
+        "/v1 generating with model=%s prompt=%s negative=%s",
+        settings.model,
         settings.prompt,
-        negative_prompt=settings.negative,
-        num_inference_steps=50,
-        true_cfg_scale=4.0,
-        generator=generator,
-    ).images[0]
-
+        settings.negative,
+    )
+    image = generate_pil_image(settings)
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
     buffer.seek(0)
@@ -292,12 +306,17 @@ def v1():
 if __name__ == '__main__':
     args = parse_args()
 
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+
     # Initialize model configuration
     MODELS_PATH = args.models_path
     MODEL_OPTIONS = discover_models(MODELS_PATH)
     DEFAULT_MODEL = MODEL_OPTIONS[0]
 
-    print(f"Discovered models: {MODEL_OPTIONS}")
-    print(f"Default model: {DEFAULT_MODEL}")
-    print(f"Server starting at http://{args.host}:{args.port}")
+    LOGGER.info("Discovered models: %s", MODEL_OPTIONS)
+    LOGGER.info("Default model: %s", DEFAULT_MODEL)
+    LOGGER.info("Server starting at http://%s:%s", args.host, args.port)
     app.run(host=args.host, port=args.port, debug=False)
