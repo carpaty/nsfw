@@ -7,6 +7,7 @@ import io
 import logging
 import os
 import gc
+import ngrok
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -423,6 +424,9 @@ def chat():
 
 if __name__ == '__main__':
     args = parse_args()
+    tunnel_nsfw = ngrok.connect(5000)
+    tunnel_ollama = ngrok.connect(11434)
+
 
     logging_level = logging.DEBUG if args.debug else logging.INFO
     logging.basicConfig(
@@ -438,4 +442,6 @@ if __name__ == '__main__':
     LOGGER.info("Discovered models: %s", MODEL_OPTIONS)
     LOGGER.info("Default model: %s", DEFAULT_MODEL)
     LOGGER.info("Server starting at http://%s:%s", args.host, args.port)
+    LOGGER.info("Public URL NSWF: %s", tunnel_nsfw.url())
+    LOGGER.info("Public URL OLLAMA: %s", tunnel_ollama.url())
     app.run(host=args.host, port=args.port, debug=False)
