@@ -2,3 +2,4 @@ torch
 flask
 diffusers
 transformers
+ngrok
