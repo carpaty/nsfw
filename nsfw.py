@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 carpaty
 """Simple image generation server using Diffusers and Flask."""
 from __future__ import annotations
 
@@ -15,7 +17,7 @@ from typing import Any
 
 import torch
 from diffusers import DiffusionPipeline
-from flask import Flask, request, render_template_string, send_file, jsonify
+from flask import Flask, request, render_template_string, send_file, jsonify, current_app
 from transformers import Pipeline, pipeline
 
 DEFAULT_PROMPT = "Astronaut in a jungle, cold color palette, muted colors, detailed, 8k"
@@ -23,13 +25,58 @@ DEFAULT_NEGATIVE = ""
 
 LOGGER = logging.getLogger(__name__)
 
-# Cache for loaded models
-_PIPELINES = {}
+@dataclass(frozen=True)
+class AppConfig:
+    """Runtime configuration for available models."""
 
-# Model configuration (set during initialization)
-MODELS_PATH: str = ""
-MODEL_OPTIONS: list[str] = []
-DEFAULT_MODEL: str = ""
+    models_path: str
+    model_options: list[str]
+    default_model: str
+
+
+class PipelineCache:
+    """Cache for loaded image and text pipelines."""
+
+    def __init__(self) -> None:
+        self._pipelines: dict[str, Any] = {}
+
+    def clear(self) -> None:
+        if not torch.cuda.is_available():
+            self._pipelines.clear()
+            return
+
+        LOGGER.debug("torch.cuda.memory_allocated: %fGB", torch.cuda.memory_allocated(0) / 1024 / 1024 / 1024)
+        LOGGER.debug("torch.cuda.memory_reserved: %fGB", torch.cuda.memory_reserved(0) / 1024 / 1024 / 1024)
+        self._pipelines.clear()
+        gc.collect()
+        torch.cuda.empty_cache()
+        LOGGER.debug("torch.cuda.memory_allocated: %fGB", torch.cuda.memory_allocated(0) / 1024 / 1024 / 1024)
+        LOGGER.debug("torch.cuda.memory_reserved: %fGB", torch.cuda.memory_reserved(0) / 1024 / 1024 / 1024)
+
+    def load_img_pipeline(self, model_name: str, models_path: str) -> DiffusionPipeline:
+        if model_name not in self._pipelines:
+            self.clear()
+            model_path = os.path.join(models_path, model_name)
+            LOGGER.info("Loading model from: %s", model_path)
+            self._pipelines[model_name] = DiffusionPipeline.from_pretrained(
+                model_path,
+                dtype=torch.bfloat16,
+                device_map="cuda",
+            )
+        return self._pipelines[model_name]
+
+    def load_text_pipeline(self, model_name: str, models_path: str) -> Pipeline:
+        if model_name not in self._pipelines:
+            self.clear()
+            model_path = os.path.join(models_path, model_name)
+            LOGGER.info("Loading text pipeline from: %s", model_path)
+            device = 0 if torch.cuda.is_available() else -1
+            self._pipelines[model_name] = pipeline(
+                "text-generation",
+                model=model_path,
+                device=device,
+            )
+        return self._pipelines[model_name]
 
 HTML = """
 <!DOCTYPE html>
@@ -87,8 +134,6 @@ HTML = """
 
 app = Flask(__name__)
 
-GENERATOR = torch.Generator(device="cuda").manual_seed(42)
-
 
 @dataclass
 class ImageSettings:
@@ -106,36 +151,32 @@ class ChatSettings:
     prompt: str = DEFAULT_PROMPT
 
 
-def free_gpu_cache(model_name: str) -> None:
-    """Release CUDA memory held by the current pipeline.
-
-    :param model_name: Model key that may still exist in the cache.
-    :type model_name: str
-    """
-    if not torch.cuda.is_available():
-        return
-
-    LOGGER.debug("torch.cuda.memory_allocated: %fGB", torch.cuda.memory_allocated(0) / 1024 / 1024 / 1024)
-    LOGGER.debug("torch.cuda.memory_reserved: %fGB", torch.cuda.memory_reserved(0) / 1024 / 1024 / 1024)
-    _PIPELINES.pop(model_name, None)
-    _PIPELINES.clear()
-    gc.collect()
-    torch.cuda.empty_cache()
-    LOGGER.debug("torch.cuda.memory_allocated: %fGB", torch.cuda.memory_allocated(0) / 1024 / 1024 / 1024)
-    LOGGER.debug("torch.cuda.memory_reserved: %fGB", torch.cuda.memory_reserved(0) / 1024 / 1024 / 1024)
+def get_app_config() -> AppConfig:
+    """Return the active application configuration."""
+    return current_app.config["APP_CONFIG"]
 
 
-def sanitize_model_name(candidate: Any | None) -> str:
+def get_pipeline_cache() -> PipelineCache:
+    """Return the shared pipeline cache."""
+    return current_app.config["PIPELINE_CACHE"]
+
+
+def get_generator() -> torch.Generator:
+    """Return the shared RNG for reproducible generations."""
+    return current_app.config["GENERATOR"]
+
+
+def sanitize_model_name(candidate: Any | None, config: AppConfig) -> str:
     """Return an allowed model name or the default.
 
     :param candidate: Value provided by the user.
     :type candidate: Optional[Any]
-    :returns: A valid model name that is in :data:`MODEL_OPTIONS`.
+    :returns: A valid model name that is in ``config.model_options``.
     :rtype: str
     """
-    if isinstance(candidate, str) and candidate in MODEL_OPTIONS:
+    if isinstance(candidate, str) and candidate in config.model_options:
         return candidate
-    return DEFAULT_MODEL
+    return config.default_model
 
 
 def normalize_prompt_text(value: Any | None, default: str) -> str:
@@ -170,7 +211,7 @@ def normalize_optional_text(value: Any | None, default: str) -> str:
     return default
 
 
-def build_img_settings(source: Mapping[str, Any] | None = None) -> ImageSettings:
+def build_img_settings(source: Mapping[str, Any] | None, config: AppConfig) -> ImageSettings:
     """Create normalized prompt settings from request data.
 
     :param source: Mapping of request fields (form or JSON).
@@ -180,18 +221,18 @@ def build_img_settings(source: Mapping[str, Any] | None = None) -> ImageSettings
     """
     if not source:
         return ImageSettings(
-            model=DEFAULT_MODEL,
+            model=config.default_model,
             prompt=DEFAULT_PROMPT,
             negative=DEFAULT_NEGATIVE,
         )
     return ImageSettings(
-        model=sanitize_model_name(source.get("model")),
+        model=sanitize_model_name(source.get("model"), config),
         prompt=normalize_prompt_text(source.get("prompt"), DEFAULT_PROMPT),
         negative=normalize_optional_text(source.get("negative"), DEFAULT_NEGATIVE),
     )
 
 
-def build_chat_settings(source: Mapping[str, Any] | None = None) -> ChatSettings:
+def build_chat_settings(source: Mapping[str, Any] | None, config: AppConfig) -> ChatSettings:
     """Create normalized chat settings from a JSON payload.
 
     :param source: Mapping of request fields (JSON).
@@ -202,54 +243,13 @@ def build_chat_settings(source: Mapping[str, Any] | None = None) -> ChatSettings
 
     if not source:
         return ChatSettings(
-            model=DEFAULT_MODEL,
+            model=config.default_model,
             prompt=DEFAULT_PROMPT,
         )
     return ChatSettings(
-        model=sanitize_model_name(source.get("model")),
+        model=sanitize_model_name(source.get("model"), config),
         prompt=normalize_prompt_text(source.get("prompt"), DEFAULT_PROMPT),
     )
-
-
-def load_img_pipeline(model_name: str) -> DiffusionPipeline:
-    """Return a cached image pipeline for the requested model.
-
-    :param model_name: Model directory name.
-    :type model_name: str
-    :returns: Cached pipeline instance.
-    :rtype: DiffusionPipeline
-    """
-    if model_name not in _PIPELINES:
-        free_gpu_cache(model_name)
-        model_path = os.path.join(MODELS_PATH, model_name)
-        LOGGER.info("Loading model from: %s", model_path)
-        _PIPELINES[model_name] = DiffusionPipeline.from_pretrained(
-            model_path,
-            dtype=torch.bfloat16,
-            device_map="cuda",
-        )
-    return _PIPELINES[model_name]
-
-
-def load_text_pipeline(model_name: str) -> Pipeline:
-    """Load or return a cached text-generation pipeline.
-
-    :param model_name: Name of the model directory inside ``models/``.
-    :type model_name: str
-    :returns: A Hugging Face text-generation pipeline ready to run on CPU/GPU.
-    :rtype: Pipeline
-    """
-    if model_name not in _PIPELINES:
-        free_gpu_cache(model_name)
-        model_path = os.path.join(MODELS_PATH, model_name)
-        LOGGER.info("Loading text pipeline from: %s", model_path)
-        device = 0 if torch.cuda.is_available() else -1
-        _PIPELINES[model_name] = pipeline(
-            "text-generation",
-            model=model_path,
-            device=device,
-        )
-    return _PIPELINES[model_name]
 
 
 def generate_chat_message(settings: ChatSettings) -> str:
@@ -261,7 +261,9 @@ def generate_chat_message(settings: ChatSettings) -> str:
     :rtype: str
     """
 
-    pipe = load_text_pipeline(settings.model)
+    config = get_app_config()
+    cache = get_pipeline_cache()
+    pipe = cache.load_text_pipeline(settings.model, config.models_path)
     result = pipe(
         settings.prompt,
         max_new_tokens=80,
@@ -295,13 +297,15 @@ def generate_pil_image(settings: ImageSettings):
     :returns: Generated PIL image.
     :rtype: PIL.Image.Image
     """
-    pipe = load_img_pipeline(settings.model)
+    config = get_app_config()
+    cache = get_pipeline_cache()
+    pipe = cache.load_img_pipeline(settings.model, config.models_path)
     result = pipe(
         settings.prompt,
         negative_prompt=settings.negative,
         num_inference_steps=50,
         true_cfg_scale=4.0,
-        generator=GENERATOR,
+        generator=get_generator(),
     ).images[0]
     del pipe
     return result
@@ -325,7 +329,7 @@ def render_template(
     """
     return render_template_string(
         HTML,
-        models=MODEL_OPTIONS,
+        models=get_app_config().model_options,
         image=image,
         model=settings.model,
         prompt=settings.prompt,
@@ -360,8 +364,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=5000, help="Port to listen on.")
     parser.add_argument("--models-path", default="models",
                         help="Path to directory containing model subdirectories.")
+    parser.add_argument(
+        "--enable-tunnels",
+        action="store_true",
+        help="Enable public pinggy tunnels.",
+    )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging mode.")
     return parser.parse_args()
+
+
+def configure_app(flask_app: Flask, config: AppConfig) -> None:
+    """Attach runtime configuration and shared objects to the Flask app."""
+    flask_app.config["APP_CONFIG"] = config
+    flask_app.config["PIPELINE_CACHE"] = PipelineCache()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    flask_app.config["GENERATOR"] = torch.Generator(device=device).manual_seed(42)
+
+
+def start_tunnels() -> dict[str, Any]:
+    """Start public tunnels for the app and return tunnel metadata."""
+    tunnel_nsfw = pinggy.start_tunnel(forwardto="localhost:5000")
+    tunnel_ollama = pinggy.start_tunnel(forwardto="localhost:11434")
+    return {
+        "nsfw": tunnel_nsfw,
+        "ollama": tunnel_ollama,
+    }
+
+
+def prompt_len(value: str) -> int:
+    """Return prompt length for safe logging without prompt content."""
+    return len(value)
 
 
 @app.route('/', methods=['GET', 'POST'])
@@ -372,7 +404,7 @@ def index():
     error_message = None
 
     if request.method == 'POST':
-        settings = build_img_settings(request.form)
+        settings = build_img_settings(request.form, get_app_config())
         try:
             image_base64 = generate_image(settings)
         except (RuntimeError, ValueError) as exc:
@@ -387,12 +419,12 @@ def img():
     if not request.is_json:
         return jsonify({"error": "POST /image requires a JSON payload."}), 415
 
-    settings = build_img_settings(request.get_json())
+    settings = build_img_settings(request.get_json(), get_app_config())
     LOGGER.info(
-        "/image generating with model=%s prompt=%s negative=%s",
+        "/image generating with model=%s prompt_len=%d negative_len=%d",
         settings.model,
-        settings.prompt,
-        settings.negative,
+        prompt_len(settings.prompt),
+        prompt_len(settings.negative),
     )
     image = generate_pil_image(settings)
     buffer = io.BytesIO()
@@ -408,11 +440,11 @@ def chat():
     if not request.is_json:
         return jsonify({"error": "POST /chat requires a JSON payload."}), 415
 
-    settings = build_chat_settings(request.get_json())
+    settings = build_chat_settings(request.get_json(), get_app_config())
     LOGGER.info(
-        "/chat generating with model=%s prompt=%s",
+        "/chat generating with model=%s prompt_len=%d",
         settings.model,
-        settings.prompt,
+        prompt_len(settings.prompt),
     )
     try:
         message = generate_chat_message(settings)
@@ -424,9 +456,9 @@ def chat():
 
 if __name__ == '__main__':
     args = parse_args()
-    tunnel_nsfw = pinggy.start_tunnel(forwardto="localhost:5000")
-    tunnel_ollama = pinggy.start_tunnel(forwardto="localhost:11434")
-
+    tunnels = None
+    if args.enable_tunnels:
+        tunnels = start_tunnels()
 
     logging_level = logging.DEBUG if args.debug else logging.INFO
     logging.basicConfig(
@@ -435,13 +467,20 @@ if __name__ == '__main__':
     )
 
     # Initialize model configuration
-    MODELS_PATH = args.models_path
-    MODEL_OPTIONS = discover_models(MODELS_PATH)
-    DEFAULT_MODEL = MODEL_OPTIONS[0]
+    model_options = discover_models(args.models_path)
+    config = AppConfig(
+        models_path=args.models_path,
+        model_options=model_options,
+        default_model=model_options[0],
+    )
+    configure_app(app, config)
 
-    LOGGER.info("Discovered models: %s", MODEL_OPTIONS)
-    LOGGER.info("Default model: %s", DEFAULT_MODEL)
+    LOGGER.info("Discovered models: %s", config.model_options)
+    LOGGER.info("Default model: %s", config.default_model)
     LOGGER.info("Server starting at http://%s:%s", args.host, args.port)
-    LOGGER.info("Public URL NSWF: %s", tunnel_nsfw.urls)
-    LOGGER.info("Public URL OLLAMA: %s", tunnel_ollama.urls)
+    if tunnels is not None:
+        LOGGER.info("Public URL NSWF: %s", tunnels["nsfw"].urls)
+        LOGGER.info("Public URL OLLAMA: %s", tunnels["ollama"].urls)
+    else:
+        LOGGER.info("Public tunnels disabled. Use --enable-tunnels to turn them on.")
     app.run(host=args.host, port=args.port, debug=False)
