@@ -10,6 +10,8 @@ import io
 import logging
 import os
 import gc
+import threading
+import time
 import pinggy
 import urllib.error
 import urllib.request
@@ -377,6 +379,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional URL to register the NSFW HTTPS tunnel as JSON {'URL': '<tunnel_url>'}.",
     )
+    parser.add_argument(
+        "--tunnel-check-interval",
+        type=int,
+        default=1200,
+        help="Seconds between pinggy tunnel health checks when tunnels are enabled.",
+    )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging mode.")
     return parser.parse_args()
 
@@ -416,7 +424,7 @@ def select_https_tunnel_url(tunnel: Any) -> str | None:
 
 def register_pinggy_url(tunnel_url: str, endpoint_url: str) -> bool:
     """Register an NSFW tunnel URL with a coordination service endpoint."""
-    payload = json.dumps({"URL": tunnel_url}).encode("utf-8")
+    payload = json.dumps({"url": tunnel_url, "provider": "nsfw"}).encode("utf-8")
     request = urllib.request.Request(
         endpoint_url,
         data=payload,
@@ -438,6 +446,63 @@ def register_pinggy_url(tunnel_url: str, endpoint_url: str) -> bool:
     except urllib.error.URLError as exc:
         LOGGER.warning("Failed to register NSFW tunnel URL: %s", exc)
         return False
+
+
+def is_tunnel_url_reachable(tunnel_url: str, timeout: float = 5.0) -> bool:
+    """Check whether a tunnel URL responds to an HTTP request."""
+    request = urllib.request.Request(tunnel_url, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.getcode() < 500
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return False
+
+
+def log_tunnel_urls(tunnels: dict[str, Any]) -> None:
+    """Log tunnel URL metadata for NSFW and OLLAMA endpoints."""
+    LOGGER.info("Public URL NSWF: %s", getattr(tunnels["nsfw"], "urls", []))
+    LOGGER.info("Public URL OLLAMA: %s", getattr(tunnels["ollama"], "urls", []))
+
+
+def maybe_register_nsfw_tunnel(tunnels: dict[str, Any], register_endpoint_url: str | None) -> None:
+    """Register NSFW HTTPS tunnel URL when a registration endpoint is configured."""
+    if not register_endpoint_url:
+        LOGGER.info("Tunnel registration skipped. Set --tunnel-register-url to enable it.")
+        return
+    nsfw_https_url = select_https_tunnel_url(tunnels["nsfw"])
+    if nsfw_https_url is None:
+        LOGGER.warning("Could not find HTTPS NSFW tunnel URL in pinggy response")
+        return
+    register_pinggy_url(nsfw_https_url, register_endpoint_url)
+
+
+def refresh_tunnels_if_needed(
+    tunnels: dict[str, Any],
+    register_endpoint_url: str | None,
+) -> dict[str, Any]:
+    """Recreate pinggy tunnels when the NSFW tunnel appears disconnected."""
+    nsfw_https_url = select_https_tunnel_url(tunnels["nsfw"])
+    if nsfw_https_url and is_tunnel_url_reachable(nsfw_https_url):
+        return tunnels
+
+    LOGGER.warning("NSFW tunnel disconnected or unreachable. Reconnecting pinggy tunnels.")
+    new_tunnels = start_tunnels()
+    log_tunnel_urls(new_tunnels)
+    maybe_register_nsfw_tunnel(new_tunnels, register_endpoint_url)
+    return new_tunnels
+
+
+def tunnel_maintenance_worker(
+    initial_tunnels: dict[str, Any],
+    register_endpoint_url: str | None,
+    check_interval_seconds: int,
+) -> None:
+    """Background worker that keeps pinggy tunnels alive and re-registers NSFW URL."""
+    tunnels = initial_tunnels
+    interval = max(5, check_interval_seconds)
+    while True:
+        time.sleep(interval)
+        tunnels = refresh_tunnels_if_needed(tunnels, register_endpoint_url)
 
 
 def prompt_len(value: str) -> int:
@@ -528,15 +593,19 @@ if __name__ == '__main__':
     LOGGER.info("Default model: %s", config.default_model)
     LOGGER.info("Server starting at http://%s:%s", args.host, args.port)
     if tunnels is not None:
-        LOGGER.info("Public URL NSWF: %s", tunnels["nsfw"].urls)
-        LOGGER.info("Public URL OLLAMA: %s", tunnels["ollama"].urls)
-        nsfw_https_url = select_https_tunnel_url(tunnels["nsfw"])
-        if args.tunnel_register_url and nsfw_https_url is not None:
-            register_pinggy_url(nsfw_https_url, args.tunnel_register_url)
-        elif args.tunnel_register_url and nsfw_https_url is None:
-            LOGGER.warning("Could not find HTTPS NSFW tunnel URL in pinggy response")
-        else:
-            LOGGER.info("Tunnel registration skipped. Set --tunnel-register-url to enable it.")
+        log_tunnel_urls(tunnels)
+        maybe_register_nsfw_tunnel(tunnels, args.tunnel_register_url)
+        worker = threading.Thread(
+            target=tunnel_maintenance_worker,
+            args=(tunnels, args.tunnel_register_url, args.tunnel_check_interval),
+            daemon=True,
+            name="pinggy-tunnel-maintenance",
+        )
+        worker.start()
+        LOGGER.info(
+            "Started pinggy tunnel maintenance thread with check interval=%ss",
+            max(5, args.tunnel_check_interval),
+        )
     else:
         LOGGER.info("Public tunnels disabled. Use --enable-tunnels to turn them on.")
     app.run(host=args.host, port=args.port, debug=False)

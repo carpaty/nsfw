@@ -10,6 +10,8 @@ Lightweight Flask app that exposes both image generation (`/`, `/image`) and tex
 - `/image` REST endpoint for scripted image generation
 - `/chat` endpoint that reuses the same local checkpoints for short text responses
 - Automatic discovery of checkpoint directories under `models/`
+- Optional pinggy public tunnels (`--enable-tunnels`) for NSFW and OLLAMA ports
+- Automatic tunnel health checks with reconnect + re-register on disconnect
 - Optional `--debug` flag that surfaces CUDA memory diagnostics
 
 ## Requirements
@@ -51,8 +53,29 @@ Lightweight Flask app that exposes both image generation (`/`, `/image`) and tex
 | `--port` | Port to listen on | `5000` |
 | `--models-path` | Directory containing model subfolders | `models` |
 | `--enable-tunnels` | Enable public pinggy tunnels for NSFW and OLLAMA | `false` |
-| `--tunnel-register-url` | Optional endpoint to register NSFW HTTPS tunnel URL as `{"URL":"..."}` | unset |
+| `--tunnel-register-url` | Optional endpoint to register NSFW HTTPS tunnel URL as `{"url":"...","provider":"nsfw"}` | unset |
+| `--tunnel-check-interval` | Seconds between tunnel health checks; reconnects and re-registers when NSFW tunnel drops | `1200` |
 | `--debug` | Enable debug logging, including CUDA metrics | `false` |
+
+### Tunnel Mode
+
+Enable public tunnels and optional URL registration:
+
+```bash
+python nsfw.py \
+  --models-path models \
+  --enable-tunnels \
+  --tunnel-register-url https://example.com/pinggy \
+  --tunnel-check-interval 1200
+```
+
+When `--tunnel-register-url` is set, the server POSTs JSON like:
+
+```json
+{"url":"https://<nsfw-tunnel-host>.a.free.pinggy.link","provider":"nsfw"}
+```
+
+If pinggy logs `Tunnel disconnected with msg Ended`, the maintenance worker recreates tunnels and re-registers the new NSFW URL.
 
 ## API Usage
 
