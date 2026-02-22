@@ -253,6 +253,7 @@ def test_parse_args_defaults(monkeypatch):
     assert args.debug is False
     assert args.enable_tunnels is False
     assert args.tunnel_register_url is None
+    assert args.tunnel_check_interval == 1200
 
 
 def test_parse_args_custom(monkeypatch):
@@ -271,6 +272,8 @@ def test_parse_args_custom(monkeypatch):
             "--enable-tunnels",
             "--tunnel-register-url",
             "https://example.com/pinggy",
+            "--tunnel-check-interval",
+            "45",
         ],
     )
     args = nsfw.parse_args()
@@ -280,6 +283,7 @@ def test_parse_args_custom(monkeypatch):
     assert args.debug is True
     assert args.enable_tunnels is True
     assert args.tunnel_register_url == "https://example.com/pinggy"
+    assert args.tunnel_check_interval == 45
 
 
 def test_start_tunnels_calls_pinggy_twice(monkeypatch):
@@ -338,7 +342,10 @@ def test_register_pinggy_url_posts_json_payload(monkeypatch):
     assert calls["request"].full_url == endpoint
     assert calls["request"].get_method() == "POST"
     assert calls["request"].get_header("Content-type") == "application/json"
-    assert json.loads(calls["request"].data.decode("utf-8")) == {"URL": "https://secure.example"}
+    assert json.loads(calls["request"].data.decode("utf-8")) == {
+        "url": "https://secure.example",
+        "provider": "nsfw",
+    }
 
 
 def test_register_pinggy_url_returns_false_on_url_error(monkeypatch):
@@ -347,6 +354,35 @@ def test_register_pinggy_url_returns_false_on_url_error(monkeypatch):
 
     monkeypatch.setattr(nsfw.urllib.request, "urlopen", fake_urlopen)
     assert nsfw.register_pinggy_url("https://secure.example", "https://example.com/pinggy") is False
+
+
+def test_refresh_tunnels_if_needed_keeps_healthy_tunnel(monkeypatch):
+    tunnels = {"nsfw": types.SimpleNamespace(urls=["https://secure.example"]), "ollama": object()}
+    monkeypatch.setattr(nsfw, "select_https_tunnel_url", lambda _tunnel: "https://secure.example")
+    monkeypatch.setattr(nsfw, "is_tunnel_url_reachable", lambda _url: True)
+    monkeypatch.setattr(nsfw, "start_tunnels", lambda: pytest.fail("start_tunnels should not be called"))
+    out = nsfw.refresh_tunnels_if_needed(tunnels, "https://example.com/pinggy")
+    assert out is tunnels
+
+
+def test_refresh_tunnels_if_needed_reconnects_and_registers(monkeypatch):
+    old_tunnels = {"nsfw": types.SimpleNamespace(urls=["https://old.example"]), "ollama": object()}
+    new_tunnels = {
+        "nsfw": types.SimpleNamespace(urls=["https://new.example"], url="https://new.example"),
+        "ollama": types.SimpleNamespace(urls=["https://ollama.example"]),
+    }
+    state = {"registered": None}
+    monkeypatch.setattr(nsfw, "select_https_tunnel_url", lambda tunnel: getattr(tunnel, "url", None))
+    monkeypatch.setattr(nsfw, "start_tunnels", lambda: new_tunnels)
+    monkeypatch.setattr(nsfw, "log_tunnel_urls", lambda _tunnels: None)
+
+    def fake_register(tunnel_url, endpoint_url):
+        state["registered"] = (tunnel_url, endpoint_url)
+
+    monkeypatch.setattr(nsfw, "register_pinggy_url", fake_register)
+    out = nsfw.refresh_tunnels_if_needed(old_tunnels, "https://example.com/pinggy")
+    assert out is new_tunnels
+    assert state["registered"] == ("https://new.example", "https://example.com/pinggy")
 
 
 def test_pipeline_cache_clear_cpu_only(monkeypatch):
