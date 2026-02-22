@@ -50,6 +50,8 @@ Lightweight Flask app that exposes both image generation (`/`, `/image`) and tex
 | `--host` | Host/IP to bind the Flask server | `0.0.0.0` |
 | `--port` | Port to listen on | `5000` |
 | `--models-path` | Directory containing model subfolders | `models` |
+| `--enable-tunnels` | Enable public pinggy tunnels for NSFW and OLLAMA | `false` |
+| `--tunnel-register-url` | Optional endpoint to register NSFW HTTPS tunnel URL as `{"URL":"..."}` | unset |
 | `--debug` | Enable debug logging, including CUDA metrics | `false` |
 
 ## API Usage

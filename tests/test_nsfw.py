@@ -2,6 +2,7 @@ import importlib
 import sys
 import types
 import base64
+import json
 
 import pytest
 
@@ -251,6 +252,7 @@ def test_parse_args_defaults(monkeypatch):
     assert args.models_path == "models"
     assert args.debug is False
     assert args.enable_tunnels is False
+    assert args.tunnel_register_url is None
 
 
 def test_parse_args_custom(monkeypatch):
@@ -267,6 +269,8 @@ def test_parse_args_custom(monkeypatch):
             "/x/models",
             "--debug",
             "--enable-tunnels",
+            "--tunnel-register-url",
+            "https://example.com/pinggy",
         ],
     )
     args = nsfw.parse_args()
@@ -275,6 +279,7 @@ def test_parse_args_custom(monkeypatch):
     assert args.models_path == "/x/models"
     assert args.debug is True
     assert args.enable_tunnels is True
+    assert args.tunnel_register_url == "https://example.com/pinggy"
 
 
 def test_start_tunnels_calls_pinggy_twice(monkeypatch):
@@ -292,6 +297,56 @@ def test_start_tunnels_calls_pinggy_twice(monkeypatch):
         {"forwardto": "localhost:5000"},
         {"forwardto": "localhost:11434"},
     ]
+
+
+def test_select_https_tunnel_url_prefers_https_from_urls():
+    tunnel = types.SimpleNamespace(
+        url="http://plain.example",
+        urls=["http://plain.example", "https://secure.example"],
+    )
+    assert nsfw.select_https_tunnel_url(tunnel) == "https://secure.example"
+
+
+def test_select_https_tunnel_url_uses_single_https_url():
+    tunnel = types.SimpleNamespace(url="https://secure.example")
+    assert nsfw.select_https_tunnel_url(tunnel) == "https://secure.example"
+
+
+def test_register_pinggy_url_posts_json_payload(monkeypatch):
+    endpoint = "https://example.com/pinggy"
+    calls = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            return False
+
+        def getcode(self):
+            return 200
+
+    def fake_urlopen(request, timeout):
+        calls["request"] = request
+        calls["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr(nsfw.urllib.request, "urlopen", fake_urlopen)
+    ok = nsfw.register_pinggy_url("https://secure.example", endpoint)
+    assert ok is True
+    assert calls["timeout"] == 10
+    assert calls["request"].full_url == endpoint
+    assert calls["request"].get_method() == "POST"
+    assert calls["request"].get_header("Content-type") == "application/json"
+    assert json.loads(calls["request"].data.decode("utf-8")) == {"URL": "https://secure.example"}
+
+
+def test_register_pinggy_url_returns_false_on_url_error(monkeypatch):
+    def fake_urlopen(_request, timeout=None):
+        raise nsfw.urllib.error.URLError("offline")
+
+    monkeypatch.setattr(nsfw.urllib.request, "urlopen", fake_urlopen)
+    assert nsfw.register_pinggy_url("https://secure.example", "https://example.com/pinggy") is False
 
 
 def test_pipeline_cache_clear_cpu_only(monkeypatch):

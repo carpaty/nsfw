@@ -9,7 +9,7 @@ export LANG=C
 
 SESSION="mywork"
 BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
-COMMAND="source $HOME/ai-models/.venv/bin/activate && pushd \"$BASE_DIR\" && python3.12 ./nsfw.py --models-path=../models"
+COMMAND="source $HOME/ai-models/.venv/bin/activate && pushd \"$BASE_DIR\" && python3.12 ./nsfw.py --models-path=../models ${NSFW_ARGS:-}"
 
 # Helper functions
 session_exists() {
