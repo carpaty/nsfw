@@ -5,11 +5,14 @@ from __future__ import annotations
 
 import argparse
 import base64
+import json
 import io
 import logging
 import os
 import gc
 import pinggy
+import urllib.error
+import urllib.request
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -369,6 +372,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable public pinggy tunnels.",
     )
+    parser.add_argument(
+        "--tunnel-register-url",
+        default=None,
+        help="Optional URL to register the NSFW HTTPS tunnel as JSON {'URL': '<tunnel_url>'}.",
+    )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging mode.")
     return parser.parse_args()
 
@@ -389,6 +397,47 @@ def start_tunnels() -> dict[str, Any]:
         "nsfw": tunnel_nsfw,
         "ollama": tunnel_ollama,
     }
+
+
+def select_https_tunnel_url(tunnel: Any) -> str | None:
+    """Select the first HTTPS URL from pinggy tunnel metadata."""
+    candidates: list[str] = []
+    single_url = getattr(tunnel, "url", None)
+    if isinstance(single_url, str):
+        candidates.append(single_url)
+    urls = getattr(tunnel, "urls", None)
+    if isinstance(urls, list | tuple):
+        candidates.extend(url for url in urls if isinstance(url, str))
+    for url in candidates:
+        if url.startswith("https://"):
+            return url
+    return None
+
+
+def register_pinggy_url(tunnel_url: str, endpoint_url: str) -> bool:
+    """Register an NSFW tunnel URL with a coordination service endpoint."""
+    payload = json.dumps({"URL": tunnel_url}).encode("utf-8")
+    request = urllib.request.Request(
+        endpoint_url,
+        data=payload,
+        headers={"content-type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            status_code = response.getcode()
+            if 200 <= status_code < 300:
+                LOGGER.info("Registered NSFW tunnel URL with %s", endpoint_url)
+                return True
+            LOGGER.warning(
+                "Failed to register NSFW tunnel URL. status=%s endpoint=%s",
+                status_code,
+                endpoint_url,
+            )
+            return False
+    except urllib.error.URLError as exc:
+        LOGGER.warning("Failed to register NSFW tunnel URL: %s", exc)
+        return False
 
 
 def prompt_len(value: str) -> int:
@@ -481,6 +530,13 @@ if __name__ == '__main__':
     if tunnels is not None:
         LOGGER.info("Public URL NSWF: %s", tunnels["nsfw"].urls)
         LOGGER.info("Public URL OLLAMA: %s", tunnels["ollama"].urls)
+        nsfw_https_url = select_https_tunnel_url(tunnels["nsfw"])
+        if args.tunnel_register_url and nsfw_https_url is not None:
+            register_pinggy_url(nsfw_https_url, args.tunnel_register_url)
+        elif args.tunnel_register_url and nsfw_https_url is None:
+            LOGGER.warning("Could not find HTTPS NSFW tunnel URL in pinggy response")
+        else:
+            LOGGER.info("Tunnel registration skipped. Set --tunnel-register-url to enable it.")
     else:
         LOGGER.info("Public tunnels disabled. Use --enable-tunnels to turn them on.")
     app.run(host=args.host, port=args.port, debug=False)
